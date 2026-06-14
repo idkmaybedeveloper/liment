@@ -28,6 +28,7 @@ pub struct UsageResponse {
   pub extra_usage: Option<ExtraUsage>,
 }
 
+#[expect(unused)]
 /// Weekdays 13:00–19:00 GMT are peak hours for Claude.
 pub fn compute_claude_peak_hours() -> PeakHoursInfo {
   let now = Timestamp::now().to_zoned(jiff::tz::TimeZone::get("GMT").unwrap());
