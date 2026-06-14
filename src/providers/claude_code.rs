@@ -3,7 +3,7 @@ use std::{
   time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{ContextCompat as _, Result};
+use color_eyre::eyre::{ContextCompat as _, Result, bail};
 use jiff::Timestamp;
 use rgb::Rgb;
 use secrecy::{ExposeSecret, SecretString};
@@ -194,6 +194,8 @@ impl std::fmt::Display for SubscriptionTier {
 pub struct ClaudeCodeProvider {
   token: Mutex<TokenState>,
   backoff: Mutex<BackoffState>,
+  /// Whether keychain reads (including token refreshes) go through the `security` CLI.
+  cli_keychain: bool,
   /// Organization UUID, lazily populated from the first profile fetch.
   org_uuid: Mutex<Option<String>>,
   /// Cached overage credit grant info, refreshed at most once per `OVERAGE_GRANT_TTL`.
@@ -218,10 +220,10 @@ struct OverageGrantCache {
 }
 
 impl ClaudeCodeProvider {
-  pub fn new(settings: &ClaudeCodeSettings) -> Result<Self> {
+  pub fn new(settings: &ClaudeCodeSettings, cli_keychain: bool) -> Result<Self> {
     log::info!("Initializing Claude Code provider");
 
-    let token = Self::fetch_token(settings)?;
+    let token = Self::fetch_token(settings, cli_keychain)?;
 
     let backoff = Mutex::new(BackoffState {
       retry_after: None,
@@ -231,12 +233,13 @@ impl ClaudeCodeProvider {
     return Ok(Self {
       token: Mutex::new(token),
       backoff,
+      cli_keychain,
       org_uuid: Mutex::new(None),
       overage_grant: Mutex::new(OverageGrantCache::default()),
     });
   }
 
-  fn fetch_token(settings: &ClaudeCodeSettings) -> Result<TokenState> {
+  fn fetch_token(settings: &ClaudeCodeSettings, cli_keychain: bool) -> Result<TokenState> {
     if let Some(token) = &settings.token {
       log::info!("Using token from provider settings");
 
@@ -248,10 +251,42 @@ impl ClaudeCodeProvider {
 
     log::debug!("Token not set in config, fetching from keychain");
 
-    return Self::fetch_keychain_token();
+    return Self::fetch_keychain_token(cli_keychain);
   }
 
-  fn fetch_keychain_token() -> Result<TokenState> {
+  /// Reads and parses the Claude Code OAuth credentials from the macOS login keychain.
+  ///
+  /// When `cli` is set, the read is delegated to the `security` command-line tool instead of the
+  /// keychain API. Because the requesting process is then Apple's signed `security` binary (which
+  /// the item's ACL trusts) rather than this app, the per-app keychain access prompt never appears.
+  fn fetch_keychain_token(cli: bool) -> Result<TokenState> {
+    let json_str = if cli { Self::read_keychain_via_cli()? } else { Self::read_keychain_via_api()? };
+
+    #[derive(Deserialize)]
+    struct ClaudeOAuth {
+      #[serde(rename = "accessToken")]
+      access_token: String,
+      #[serde(rename = "expiresAt")]
+      expires_at: Option<i64>,
+    }
+
+    #[derive(Deserialize)]
+    struct ClaudeKeychain {
+      #[serde(rename = "claudeAiOauth")]
+      claude_oauth: ClaudeOAuth,
+    }
+
+    let value: ClaudeKeychain = serde_json::from_str(&json_str)?;
+    let expires_at = value.claude_oauth.expires_at.and_then(|ms| Timestamp::from_millisecond(ms).ok());
+
+    return Ok(TokenState {
+      secret: SecretString::from(value.claude_oauth.access_token),
+      expires_at,
+    });
+  }
+
+  /// Reads the raw credentials JSON from the keychain using the `security_framework` API.
+  fn read_keychain_via_api() -> Result<String> {
     let results = ItemSearchOptions::new()
       .class(ItemClass::generic_password())
       .service("Claude Code-credentials")
@@ -268,27 +303,23 @@ impl ClaudeCodeProvider {
       })
       .context("Failed to find Claude Code credentials in keychain")?;
 
-    #[derive(Deserialize)]
-    struct ClaudeOAuth {
-      #[serde(rename = "accessToken")]
-      access_token: String,
-      #[serde(rename = "expiresAt")]
-      expires_at: Option<i64>,
+    return Ok(String::from_utf8(data)?);
+  }
+
+  /// Reads the raw credentials JSON by spawning `security find-generic-password`.
+  fn read_keychain_via_cli() -> Result<String> {
+    log::debug!("Reading keychain via the `security` CLI");
+
+    let output = std::process::Command::new("security")
+      .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+      .output()?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      bail!("`security find-generic-password` failed: {}", stderr.trim());
     }
 
-    #[derive(Deserialize)]
-    struct ClaudeKeychain {
-      #[serde(rename = "claudeAiOauth")]
-      claude_oauth: ClaudeOAuth,
-    }
-
-    let json_str = String::from_utf8(data)?;
-    let value: ClaudeKeychain = serde_json::from_str(&json_str)?;
-    let expires_at = value.claude_oauth.expires_at.and_then(|ms| Timestamp::from_millisecond(ms).ok());
-    return Ok(TokenState {
-      secret: SecretString::from(value.claude_oauth.access_token),
-      expires_at,
-    });
+    return Ok(String::from_utf8(output.stdout)?.trim().to_string());
   }
 
   fn fetch_usage(&self) -> Option<UsageResponse> {
@@ -379,7 +410,7 @@ impl ClaudeCodeProvider {
     };
     if needs_refresh {
       log::debug!("Access token expired, re-reading keychain before request");
-      match Self::fetch_keychain_token() {
+      match Self::fetch_keychain_token(self.cli_keychain) {
         Ok(new_state) => {
           let mut token_guard = self.token.lock().unwrap();
           if new_state.secret.expose_secret() == token_guard.secret.expose_secret() {
@@ -401,7 +432,7 @@ impl ClaudeCodeProvider {
     if let Err(ureq::Error::StatusCode(401)) = &result {
       log::warn!("Got 401 for {}, refreshing token from keychain", url);
 
-      if let Ok(new_state) = Self::fetch_keychain_token() {
+      if let Ok(new_state) = Self::fetch_keychain_token(self.cli_keychain) {
         {
           let mut token_guard = self.token.lock().unwrap();
           if new_state.secret.expose_secret() == token_guard.secret.expose_secret() {

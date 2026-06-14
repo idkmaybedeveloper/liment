@@ -151,12 +151,16 @@ impl DataProvider for NullProvider {
 }
 
 impl ProviderKind {
-  pub fn into_provider(self, settings: &ProviderSettings) -> color_eyre::eyre::Result<Arc<dyn DataProvider>> {
+  pub fn into_provider(
+    self,
+    settings: &ProviderSettings,
+    cli_keychain: bool,
+  ) -> color_eyre::eyre::Result<Arc<dyn DataProvider>> {
     match self {
       ProviderKind::ClaudeCode => {
         let settings = settings.claude_code.clone().unwrap_or_default();
 
-        return Ok(Arc::new(ClaudeCodeProvider::new(&settings)?));
+        return Ok(Arc::new(ClaudeCodeProvider::new(&settings, cli_keychain)?));
       }
 
       ProviderKind::CliproxyClaude => {

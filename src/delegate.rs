@@ -284,7 +284,7 @@ impl AppDelegate {
   }
 
   fn provider_from_config(config: &Config) -> Arc<dyn DataProvider> {
-    let provider = match config.provider.into_provider(&config.settings) {
+    let provider = match config.provider.into_provider(&config.settings, config.cli_keychain) {
       Ok(provider) => provider,
       Err(e) => {
         let msg = format!("Failed to create provider: {e:#}");

@@ -73,6 +73,10 @@ pub struct Config {
   #[default(ProviderKind::ClaudeCode)]
   pub provider: ProviderKind,
 
+  /// Read the keychain token via the `security` CLI instead of the keychain API, avoiding the macOS access prompt on every fetch.
+  #[default = true]
+  pub cli_keychain: bool,
+
   /// Provider-specific settings.
   pub settings: ProviderSettings,
 }
