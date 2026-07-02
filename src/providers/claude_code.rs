@@ -21,11 +21,55 @@ pub struct ClaudeCodeSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct UsageResponse {
+  #[serde(default)]
+  pub limits: Vec<RateLimit>,
   pub five_hour: Option<UsageBucket>,
   pub seven_day: Option<UsageBucket>,
-  pub seven_day_sonnet: Option<UsageBucket>,
-  pub seven_day_opus: Option<UsageBucket>,
   pub extra_usage: Option<ExtraUsage>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimit {
+  pub kind: String,
+  #[serde(default)]
+  pub percent: Option<f64>,
+  pub resets_at: Option<Timestamp>,
+  #[serde(default)]
+  pub scope: Option<LimitScope>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LimitScope {
+  #[serde(default)]
+  pub model: Option<LimitScopeModel>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LimitScopeModel {
+  #[serde(default)]
+  pub display_name: Option<String>,
+}
+
+impl RateLimit {
+  fn to_window(&self) -> Option<UsageWindow> {
+    let (title, short_title, period_secs) = match self.kind.as_str() {
+      "session" => ("5h Limit".to_string(), Some("5h".to_string()), 5 * 3600),
+      "weekly_all" => ("7d Limit".to_string(), Some("7d".to_string()), 7 * 86400),
+      "weekly_scoped" => {
+        let name = self.scope.as_ref()?.model.as_ref()?.display_name.as_ref()?;
+        (format!("7d {}", name), None, 7 * 86400)
+      }
+      _ => return None,
+    };
+
+    return Some(UsageWindow {
+      title,
+      short_title,
+      utilization: self.percent.unwrap_or(0.0),
+      resets_at: self.resets_at,
+      period_seconds: Some(period_secs),
+    });
+  }
 }
 
 #[expect(unused)]
@@ -36,17 +80,15 @@ pub fn compute_claude_peak_hours() -> PeakHoursInfo {
   let hour = now.hour();
 
   let is_weekday = weekday != jiff::civil::Weekday::Saturday && weekday != jiff::civil::Weekday::Sunday;
-  let is_peak = is_weekday && (13 .. 19).contains(&hour);
+  let is_peak = is_weekday && (13..19).contains(&hour);
 
   let ends_at = if is_peak {
     // Peak ends at 19:00 today
     now.with().hour(19).minute(0).second(0).build().unwrap().timestamp()
-  }
-  else if is_weekday && hour < 13 {
+  } else if is_weekday && hour < 13 {
     // Off-peak ends at 13:00 today
     now.with().hour(13).minute(0).second(0).build().unwrap().timestamp()
-  }
-  else {
+  } else {
     // Weekend or weekday after 19:00 — next peak is Monday 13:00 (or tomorrow if weekday)
     let days_until = match weekday {
       jiff::civil::Weekday::Friday if hour >= 19 => 3,
@@ -72,23 +114,25 @@ impl From<UsageResponse> for UsageData {
       };
     });
 
-    let mut windows = Vec::new();
-    let buckets: &[(&str, Option<&str>, &Option<UsageBucket>, i64)] = &[
-      ("5h Limit", Some("5h"), &usage.five_hour, 5 * 3600),
-      ("7d Limit", Some("7d"), &usage.seven_day, 7 * 86400),
-      ("7d Sonnet", None, &usage.seven_day_sonnet, 7 * 86400),
-      ("7d Opus", None, &usage.seven_day_opus, 7 * 86400),
-    ];
+    let mut windows: Vec<UsageWindow> = usage.limits.iter().filter_map(RateLimit::to_window).collect();
 
-    for (title, short_title, bucket, period_secs) in buckets {
-      if let Some(b) = bucket {
-        windows.push(UsageWindow {
-          title: title.to_string(),
-          short_title: short_title.map(|s| s.to_string()),
-          utilization: b.utilization.unwrap_or(0.0),
-          resets_at: b.resets_at,
-          period_seconds: Some(*period_secs),
-        });
+    // Fall back to the legacy five_hour/seven_day fields if the `limits` array is absent.
+    if windows.is_empty() {
+      let buckets: &[(&str, Option<&str>, &Option<UsageBucket>, i64)] = &[
+        ("5h Limit", Some("5h"), &usage.five_hour, 5 * 3600),
+        ("7d Limit", Some("7d"), &usage.seven_day, 7 * 86400),
+      ];
+
+      for (title, short_title, bucket, period_secs) in buckets {
+        if let Some(b) = bucket {
+          windows.push(UsageWindow {
+            title: title.to_string(),
+            short_title: short_title.map(|s| s.to_string()),
+            utilization: b.utilization.unwrap_or(0.0),
+            resets_at: b.resets_at,
+            period_seconds: Some(*period_secs),
+          });
+        }
       }
     }
 
@@ -295,11 +339,9 @@ impl ClaudeCodeProvider {
 
     let data = results
       .into_iter()
-      .find_map(|r| {
-        match r {
-          SearchResult::Data(d) => Some(d),
-          _ => None,
-        }
+      .find_map(|r| match r {
+        SearchResult::Data(d) => Some(d),
+        _ => None,
       })
       .context("Failed to find Claude Code credentials in keychain")?;
 
@@ -445,8 +487,7 @@ impl ClaudeCodeProvider {
         log::info!("Token refreshed, retrying request");
 
         result = self.get_inner(url).inspect_err(|e| log::error!("Retry failed for {}: {}", url, e));
-      }
-      else {
+      } else {
         log::error!("Failed to refresh token from keychain");
       }
     }
