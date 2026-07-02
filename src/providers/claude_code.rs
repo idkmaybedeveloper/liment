@@ -80,15 +80,17 @@ pub fn compute_claude_peak_hours() -> PeakHoursInfo {
   let hour = now.hour();
 
   let is_weekday = weekday != jiff::civil::Weekday::Saturday && weekday != jiff::civil::Weekday::Sunday;
-  let is_peak = is_weekday && (13..19).contains(&hour);
+  let is_peak = is_weekday && (13 .. 19).contains(&hour);
 
   let ends_at = if is_peak {
     // Peak ends at 19:00 today
     now.with().hour(19).minute(0).second(0).build().unwrap().timestamp()
-  } else if is_weekday && hour < 13 {
+  }
+  else if is_weekday && hour < 13 {
     // Off-peak ends at 13:00 today
     now.with().hour(13).minute(0).second(0).build().unwrap().timestamp()
-  } else {
+  }
+  else {
     // Weekend or weekday after 19:00 — next peak is Monday 13:00 (or tomorrow if weekday)
     let days_until = match weekday {
       jiff::civil::Weekday::Friday if hour >= 19 => 3,
@@ -339,9 +341,11 @@ impl ClaudeCodeProvider {
 
     let data = results
       .into_iter()
-      .find_map(|r| match r {
-        SearchResult::Data(d) => Some(d),
-        _ => None,
+      .find_map(|r| {
+        match r {
+          SearchResult::Data(d) => Some(d),
+          _ => None,
+        }
       })
       .context("Failed to find Claude Code credentials in keychain")?;
 
@@ -487,7 +491,8 @@ impl ClaudeCodeProvider {
         log::info!("Token refreshed, retrying request");
 
         result = self.get_inner(url).inspect_err(|e| log::error!("Retry failed for {}: {}", url, e));
-      } else {
+      }
+      else {
         log::error!("Failed to refresh token from keychain");
       }
     }
